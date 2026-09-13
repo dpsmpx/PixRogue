@@ -25,6 +25,8 @@ PixelRogue — классический Rogue в "пиксельном" стил
 со случайными "обличьями" и идентификацией по применению, ловушки, туман войны.
 """
 
+import argparse
+import collections
 import pygame
 import random
 import sys
@@ -42,6 +44,9 @@ GRID_COLS, GRID_ROWS = 3, 4        # сетка комнат (как в ориг
 MAX_DEPTH = 26
 FPS = 30
 WALL, FLOOR = 1, 0
+
+# восемь направлений шага (порядок — по часовой стрелке с запада)
+DIRS8 = ((-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1))
 
 # авто-повтор хода при удержании кнопки движения
 HOLD_DELAY = 420                   # мс до начала повтора
@@ -114,8 +119,10 @@ WANDS = ["striking", "lightning", "fire", "cold", "magic_missile",
          "slow_monster", "haste_monster", "polymorph", "teleport_away",
          "cancellation", "drain_life", "light", "nothing"]
 
-# имя -> (кубиков, граней, можно ли метать)
-WEAPONS = {
+# имя -> характеристики оружия (кубиков, граней, можно ли метать)
+WeaponSpec = collections.namedtuple("WeaponSpec", "dice sides throwable")
+
+WEAPONS = {name: WeaponSpec(*spec) for name, spec in {
     "кинжал":            (1, 6, True),
     "дротик":            (1, 3, True),
     "короткий меч":      (2, 3, False),
@@ -126,7 +133,9 @@ WEAPONS = {
     "двуручный меч":     (4, 4, False),
     "короткий лук":      (1, 1, False),
     "стрела":            (1, 6, True),
-}
+}.items()}
+
+BOW, ARROW = "короткий лук", "стрела"
 THROWABLE_STACK = ("стрела", "дротик")
 
 # имя -> базовый класс брони (чем меньше, тем лучше)
@@ -179,6 +188,24 @@ SUB_RU = {
 }
 
 
+def assign_looks(subtypes, looks):
+    """Случайное «обличье» каждому подтипу предмета.
+
+    Списки обличий и списки предметов правятся независимо, поэтому таблица
+    обличий может оказаться короче: тогда лишним выдаются нумерованные
+    варианты вместо падения с IndexError. Глобальные списки не мутируются.
+    """
+    pool = list(looks)
+    random.shuffle(pool)
+    out = {}
+    for i, sub in enumerate(subtypes):
+        if i < len(pool):
+            out[sub] = pool[i]
+        else:
+            out[sub] = "%s %d" % (pool[i % len(pool)], i // len(pool) + 1)
+    return out
+
+
 def make_scroll_title():
     syl = ["зел", "го", "кас", "фид", "неж", "кло", "пра", "ту", "вун", "аш",
            "бан", "мор", "икс", "вен", "дро", "лум", "сек", "вол", "рхо", "иб"]
@@ -189,8 +216,13 @@ def make_scroll_title():
 # ============================================================================
 #  МОНСТРЫ
 #  (имя, цвет, опыт, кости HP, класс брони, атаки [(n,d)], флаги, мин.гл, макс.гл)
+#  Именованный кортеж: порядок полей совпадает с распаковкой в Monster.__init__,
+#  но обращаться к «глубине появления» можно как t.dmin, а не как t[7].
 # ============================================================================
-MONSTERS = [
+MonsterType = collections.namedtuple(
+    "MonsterType", "name color xp hd ac dmg flags dmin dmax")
+
+MONSTERS = [MonsterType(*t) for t in [
     ("нетопырь",       (170, 120, 210), 1,    1,  3, [(1, 2)], {"fly", "erratic"},          1, 8),
     ("пустельга",      (235, 150, 60),  1,    1,  7, [(1, 4)], {"mean", "fly"},             1, 6),
     ("змея",           (120, 200, 80),  2,    1,  5, [(1, 3)], {"mean"},                    1, 7),
@@ -216,7 +248,7 @@ MONSTERS = [
     ("грифон",         (235, 160, 60),  2000, 13, 2, [(4, 3), (3, 5), (4, 3)], {"mean", "fly", "regen"}, 13, 26),
     ("медуза",         (110, 210, 110), 200,  8,  2, [(3, 4), (3, 4), (2, 5)], {"mean", "confuse"},      18, 26),
     ("дракон",         (235, 60, 60),   6800, 10, -1, [(1, 8), (1, 8), (3, 10)], {"mean", "breath_fire"},15, 26),
-]
+]]
 
 XP_THRESHOLDS = [0, 10, 20, 40, 80, 160, 320, 640, 1300, 2600, 5200, 10000,
                  20000, 40000, 80000, 160000, 320000, 640000, 1300000, 2600000]
@@ -225,6 +257,11 @@ TRAP_TYPES = ["trapdoor", "teleport", "dart", "sleep_gas", "bear", "rust"]
 TRAP_NAMES = {"trapdoor": "люк", "teleport": "телепорт-ловушка",
               "dart": "дротиковая ловушка", "sleep_gas": "усыпляющий газ",
               "bear": "медвежий капкан", "rust": "ржавая ловушка"}
+
+
+def is_throwable(weapon_name):
+    spec = WEAPONS.get(weapon_name)
+    return bool(spec and spec.throwable)
 
 
 def roll(n, d):
@@ -284,6 +321,47 @@ class Item:
         if self.kind == "weapon" and self.subtype in THROWABLE_STACK:
             return (self.kind, self.subtype, self.enchant)
         return None
+
+
+class Player:
+    """Состояние персонажа.
+
+    Явный класс со __slots__ вместо анонимного объекта: опечатка в имени поля
+    падает сразу, а не создаёт молча новый атрибут, который никто не читает.
+    """
+
+    # временные эффекты: все тикают одинаково, поэтому перечислены один раз
+    TIMERS = ("confused", "blind", "hasted", "frozen", "held", "see_invis",
+              "levitate", "hallu", "detect_mon", "detect_items")
+
+    __slots__ = ("x", "y", "hp", "max_hp", "strength", "max_strength", "xp",
+                 "xp_level", "gold", "food", "inventory", "weapon", "armor",
+                 "rings", "has_amulet") + TIMERS
+
+    def __init__(self):
+        self.x = self.y = 0
+        self.max_hp = self.hp = 12
+        self.strength = self.max_strength = 16
+        self.xp = 0
+        self.xp_level = 1
+        self.gold = 0
+        self.food = 1500.0
+        self.inventory = []
+        self.weapon = None
+        self.armor = None
+        self.rings = []
+        self.has_amulet = False
+        for t in self.TIMERS:
+            setattr(self, t, 0)
+
+    def tick_timers(self):
+        for t in self.TIMERS:
+            v = getattr(self, t)
+            if v > 0:
+                setattr(self, t, v - 1)
+
+    def has_ring(self, subtype):
+        return any(r.subtype == subtype for r in self.rings)
 
 
 class Monster:
@@ -381,13 +459,23 @@ class RogueGame:
     VI_KEYS = {'h': (-1, 0), 'l': (1, 0), 'k': (0, -1), 'j': (0, 1),
                'y': (-1, -1), 'u': (1, -1), 'b': (-1, 1), 'n': (1, 1)}
 
-    def __init__(self):
+    # команды, которые тратят ход (во сне/параличе недоступны)
+    TURN_COMMANDS = frozenset((
+        'move', 'descend', 'ascend', 'search', 'quaff', 'read', 'zap', 'eat',
+        'throw', 'drop', 'wield', 'wear', 'takeoff', 'putring', 'remring'))
+
+    def __init__(self, size=None):
         pygame.init()
         try:
             pygame.mixer.quit()          # звук не нужен; на Android экономит ресурсы
         except Exception:
             pass
-        self.screen = self.create_window()
+        self.screen = self.create_window(size)
+        # движение мыши/пальца ничего не меняет в пошаговой игре, но будит
+        # перерисовку — глушим на входе, чтобы не жечь батарею
+        for ev in ("MOUSEMOTION", "FINGERMOTION"):
+            if hasattr(pygame, ev):
+                pygame.event.set_blocked(getattr(pygame, ev))
         w, h = self.screen.get_size()
         self.L = Layout(w, h)
         self.fonts = {}
@@ -400,10 +488,13 @@ class RogueGame:
         self.hold_start = 0
         self.hold_last = 0
         self.hold_hp = 0
+        self.dirty = True
         self.new_game()
 
     # ------------------------------------------------------------ окно ----
-    def create_window(self):
+    def create_window(self, size=None):
+        if size:                         # явный размер: отладка раскладок на ПК
+            return pygame.display.set_mode(size)
         info = pygame.display.Info()
         sw, sh = info.current_w, info.current_h
         if IS_ANDROID:
@@ -442,34 +533,15 @@ class RogueGame:
 
     # -------------------------------------------------- новая партия ------
     def new_game(self):
-        random.shuffle(POTION_LOOKS)
-        random.shuffle(RING_LOOKS)
-        random.shuffle(WAND_LOOKS)
         self.look = {
-            'potion': {s: POTION_LOOKS[i] for i, s in enumerate(POTIONS)},
+            'potion': assign_looks(POTIONS, POTION_LOOKS),
             'scroll': {s: make_scroll_title() for s in SCROLLS},
-            'ring':   {s: RING_LOOKS[i] for i, s in enumerate(RINGS)},
-            'wand':   {s: WAND_LOOKS[i] for i, s in enumerate(WANDS)},
+            'ring':   assign_looks(RINGS, RING_LOOKS),
+            'wand':   assign_looks(WANDS, WAND_LOOKS),
         }
         self.idd = {'potion': set(), 'scroll': set(), 'ring': set(), 'wand': set()}
 
-        p = type('P', (), {})()
-        p.x = p.y = 0
-        p.max_hp = p.hp = 12
-        p.strength = p.max_strength = 16
-        p.xp = 0
-        p.xp_level = 1
-        p.gold = 0
-        p.food = 1500.0
-        p.inventory = []
-        p.weapon = None
-        p.armor = None
-        p.rings = []
-        p.has_amulet = False
-        p.confused = p.blind = p.hasted = p.frozen = p.held = 0
-        p.see_invis = p.levitate = p.hallu = 0
-        p.detect_mon = p.detect_items = 0
-        self.p = p
+        self.p = p = Player()
 
         self.regen_counter = 0
         self.haste_toggle = False
@@ -480,6 +552,7 @@ class RogueGame:
         self.state = 'play'          # play / dead / won
         self.mode = 'play'           # play / select / direction / list / help
         self.pending = None
+        self.pending_action = None
         self.overlay = None
         self.death_cause = ""
 
@@ -572,6 +645,11 @@ class RogueGame:
         self.populate(lv, depth)
         return lv
 
+    def monster_pool(self, depth):
+        """Монстры, подходящие для глубины; на всякий случай — непустой список."""
+        pool = [m for m in MONSTERS if m.dmin <= depth <= m.dmax]
+        return pool or sorted(MONSTERS, key=lambda m: m.dmin)[-3:]
+
     def carve_corridor(self, lv, a, b):
         """Г-образный коридор: не выходит за пределы двух соседних ячеек сетки."""
         x1, y1, x2, y2 = a.cx, a.cy, b.cx, b.cy
@@ -628,6 +706,22 @@ class RogueGame:
                 break
         return best or self.free_tile(lv, avoid=[origin])
 
+    def random_free_spot(self, lv, exclude_player=False):
+        """Проходимая клетка, не занятая монстром (и, если нужно, игроком).
+
+        Нужна всем «переносам»: телепорт игрока, бегство вора, изгнание жезлом.
+        Раньше каждый из них брал free_tile() напрямую и мог поставить монстра
+        прямо на игрока или на другого монстра.
+        """
+        for _ in range(200):
+            x, y = self.free_tile(lv)
+            if self.monster_at(lv, x, y):
+                continue
+            if exclude_player and (x, y) == (self.p.x, self.p.y):
+                continue
+            return (x, y)
+        return None
+
     def occupied(self, lv, x, y):
         if lv.stairs_up == (x, y) or lv.stairs_down == (x, y):
             return True
@@ -666,9 +760,7 @@ class RogueGame:
                 return (x, y)
             return spot()
 
-        pool = [m for m in MONSTERS if m[7] <= depth <= m[8]]
-        if not pool:
-            pool = sorted(MONSTERS, key=lambda m: m[7])[-3:]
+        pool = self.monster_pool(depth)
         for _ in range(random.randint(3, 5) + depth // 4):
             x, y = spot_far()
             lv.monsters.append(Monster(random.choice(pool), x, y))
@@ -735,25 +827,25 @@ class RogueGame:
 
     # ==================================================== ХОД / ДЕЙСТВИЯ ==
     def try_move_player(self, dx, dy):
-        if self.p.frozen > 0:
-            self.msg("Ты не можешь двигаться!")
-            self.end_turn()
-            return
         if dx == 0 and dy == 0:
             self.end_turn()
             return
-        if self.p.confused > 0:
-            dx, dy = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1),
-                                    (1, 1), (-1, -1), (1, -1), (-1, 1)])
+        confused = self.p.confused > 0
+        if confused:
+            dx, dy = random.choice(DIRS8)
         nx, ny = self.p.x + dx, self.p.y + dy
-        if not (0 <= nx < MAP_COLS and 0 <= ny < MAP_ROWS):
+        if (not (0 <= nx < MAP_COLS and 0 <= ny < MAP_ROWS)
+                or self.cur.grid[ny][nx] == WALL):
+            # осознанный шаг в стену хода не стоит (как в оригинале),
+            # а вот спутанный персонаж в неё именно врезается — и ход теряет
+            if confused:
+                self.msg("Ты врезаешься в стену.")
+                self.end_turn()
             return
         m = self.monster_at(self.cur, nx, ny)
         if m is not None:
             self.attack_monster(m)
             self.end_turn()
-            return
-        if self.cur.grid[ny][nx] == WALL:
             return
         if self.p.held > 0:
             self.msg("Тебя что-то держит — не вырваться!")
@@ -774,9 +866,15 @@ class RogueGame:
             if slot[0] == self.p.x and slot[1] == self.p.y:
                 self.pick_up(slot[2])
                 lv.items.remove(slot)
+        px, py = self.p.x, self.p.y
         for t in lv.traps:
-            if t['x'] == self.p.x and t['y'] == self.p.y:
+            if t['x'] == px and t['y'] == py:
                 self.spring_trap(t)
+                # Люк уводит на другой уровень, телепорт — на другую клетку:
+                # оставшиеся ловушки ЭТОГО уровня к новой позиции уже не
+                # относятся, иначе игрок ловит чужую ловушку сразу после падения.
+                if self.cur is not lv or (self.p.x, self.p.y) != (px, py):
+                    return
         if (self.p.x, self.p.y) == lv.stairs_down:
             self.msg("Здесь лестница вниз — жми «Вниз >».")
         elif (self.p.x, self.p.y) == lv.stairs_up:
@@ -830,12 +928,10 @@ class RogueGame:
             self.rust_armor()
 
     def teleport_player(self):
-        x, y = self.free_tile(self.cur)
-        for _ in range(200):
-            if not self.monster_at(self.cur, x, y):
-                break
-            x, y = self.free_tile(self.cur)
-        self.p.x, self.p.y = x, y
+        spot = self.random_free_spot(self.cur)
+        if spot is None:
+            return
+        self.p.x, self.p.y = spot
         self.recompute_fov()
 
     def descend(self):
@@ -896,8 +992,8 @@ class RogueGame:
             self.msg("Промах: %s." % m.name)
             return
         if wpn:
-            n, d, _ = WEAPONS[wpn.subtype]
-            dmg = roll(n, d) + dam_b + wb + ring_dam
+            spec = WEAPONS[wpn.subtype]
+            dmg = roll(spec.dice, spec.sides) + dam_b + wb + ring_dam
         else:
             dmg = roll(1, 3) + dam_b
         dmg = max(1, dmg)
@@ -935,6 +1031,8 @@ class RogueGame:
             self.msg("Ты достигаешь %d уровня опыта!" % self.p.xp_level)
 
     def damage_player(self, dmg, source=""):
+        if self.state != 'play':
+            return                       # причину смерти перезаписывать нельзя
         self.p.hp -= max(0, dmg)
         if self.p.hp <= 0:
             self.p.hp = 0
@@ -965,7 +1063,7 @@ class RogueGame:
         return s
 
     def can_see_invisible(self):
-        return self.p.see_invis > 0 or any(r.subtype == "see_invisible" for r in self.p.rings)
+        return self.p.see_invis > 0 or self.p.has_ring("see_invisible")
 
     def player_ac(self):
         ac = 10
@@ -1106,7 +1204,7 @@ class RogueGame:
         self.end_turn()
 
     def spawn_near_player(self):
-        pool = [m for m in MONSTERS if m[7] <= self.depth <= m[8]] or MONSTERS[:3]
+        pool = self.monster_pool(self.depth)
         for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)]:
             x, y = self.p.x + dx, self.p.y + dy
             if (0 <= x < MAP_COLS and 0 <= y < MAP_ROWS and
@@ -1169,15 +1267,16 @@ class RogueGame:
             self.msg("%s %s!" % (target.name.capitalize(),
                                  agree(target.name, "ускорен", "ускорена", "ускорено")))
         elif s == "polymorph":
-            pool = [m for m in MONSTERS if m[7] <= self.depth <= m[8]] or MONSTERS[:3]
+            pool = self.monster_pool(self.depth)
             nm = Monster(random.choice(pool), target.x, target.y)
             self.cur.monsters.remove(target)
             self.cur.monsters.append(nm)
             self.msg("Превращение: %s -> %s!" % (target.name, nm.name))
             self.end_turn(); return
         elif s == "teleport_away":
-            tx, ty = self.free_tile(self.cur)
-            target.x, target.y = tx, ty
+            spot = self.random_free_spot(self.cur, exclude_player=True)
+            if spot:
+                target.x, target.y = spot
             self.msg("%s исчезает." % target.name.capitalize())
         elif s == "cancellation":
             target.flags = {f for f in target.flags if f == "fly"}
@@ -1206,12 +1305,12 @@ class RogueGame:
         landed = (x, y)
         thrown = self.consume_one(weapon, give_copy=True)
         if target:
-            n, dd, _ = WEAPONS[weapon.subtype]
+            spec = WEAPONS[weapon.subtype]
             bonus = self.p.xp_level + str_bonuses(self.eff_str())[0] + weapon.enchant
-            if self.p.weapon and self.p.weapon.subtype == "короткий лук" and weapon.subtype == "стрела":
+            if self.p.weapon and self.p.weapon.subtype == BOW and weapon.subtype == ARROW:
                 bonus += 2
             if random.randint(1, 20) + bonus >= 10 - target.ac:
-                dmg = max(1, roll(n, dd) + weapon.enchant)
+                dmg = max(1, roll(spec.dice, spec.sides) + weapon.enchant)
                 target.hp -= dmg
                 target.awake = True
                 self.msg("Снаряд попадает в %s (%d)." % (target.name, dmg))
@@ -1336,16 +1435,12 @@ class RogueGame:
         if self.state != 'play':
             return
         self.turn += 1
-        for attr in ("confused", "blind", "hasted", "frozen", "held", "see_invis",
-                     "levitate", "hallu", "detect_mon", "detect_items"):
-            v = getattr(self.p, attr)
-            if v > 0:
-                setattr(self.p, attr, v - 1)
-        if any(r.subtype == "searching" for r in self.p.rings):
+        self.p.tick_timers()
+        if self.p.has_ring("searching"):
             for t in self.cur.traps:
                 if abs(t['x'] - self.p.x) <= 1 and abs(t['y'] - self.p.y) <= 1:
                     t['found'] = True
-        if any(r.subtype == "teleportation" for r in self.p.rings) and random.random() < 0.04:
+        if self.p.has_ring("teleportation") and random.random() < 0.04:
             self.teleport_player()
             self.msg("Кольцо внезапно переносит тебя!")
         do_monsters = True
@@ -1354,13 +1449,14 @@ class RogueGame:
             do_monsters = self.haste_toggle
         if do_monsters:
             self.move_monsters()
-        self.hunger_tick()
-        self.regen_tick()
+        if self.state == 'play':         # погиб в свой же ход — тикать нечему
+            self.hunger_tick()
+            self.regen_tick()
         self.recompute_fov()
 
     def regen_tick(self):
         rate = max(2, 21 - 2 * self.p.xp_level)
-        if any(r.subtype == "regeneration" for r in self.p.rings):
+        if self.p.has_ring("regeneration"):
             rate = max(1, rate // 2)
         self.regen_counter += 1
         if self.regen_counter >= rate and self.p.hp < self.p.max_hp:
@@ -1386,14 +1482,17 @@ class RogueGame:
             self.msg("Ты теряешь сознание от голода!")
 
     def move_monsters(self):
-        aggravate = any(r.subtype == "aggravate_monster" for r in self.p.rings)
-        stealth = any(r.subtype == "stealth" for r in self.p.rings)
+        aggravate = self.p.has_ring("aggravate_monster")
+        stealth = self.p.has_ring("stealth")
         for m in self.cur.monsters[:]:
             if m.hp <= 0 or self.state != 'play':
                 continue
             if "regen" in m.flags and m.hp < m.max_hp and random.random() < 0.4:
                 m.hp += 1
             dist = abs(m.x - self.p.x) + abs(m.y - self.p.y)
+            # соседство — по Чебышёву: игрок бьёт по диагонали, монстр тоже
+            # (раньше монстр по манхэттену «не дотягивался» и топтался рядом)
+            adjacent = max(abs(m.x - self.p.x), abs(m.y - self.p.y)) <= 1
             if not m.awake:
                 rid_p = self.cur.room_id[self.p.y][self.p.x]
                 rid_m = self.cur.room_id[m.y][m.x]
@@ -1401,7 +1500,7 @@ class RogueGame:
                     m.awake = True
             if not m.awake:
                 continue
-            if "stationary" in m.flags and dist > 1:
+            if "stationary" in m.flags and not adjacent:
                 continue
             if "slow" in m.flags and random.random() < 0.5:
                 continue
@@ -1410,7 +1509,7 @@ class RogueGame:
                 self.msg("%s дышит огнём!" % m.name.capitalize())
                 self.damage_player(roll(2, 8) + self.depth // 3, "огонь дракона")
                 continue
-            if dist == 1:
+            if adjacent:
                 self.monster_attack_player(m)
                 continue
             if m.fleeing:
@@ -1495,7 +1594,9 @@ class RogueGame:
         return False
 
     def flee_away(self, m):
-        m.x, m.y = self.free_tile(self.cur)
+        spot = self.random_free_spot(self.cur, exclude_player=True)
+        if spot:
+            m.x, m.y = spot
         m.fleeing = True
 
     # ====================================================== ИМЕНОВАНИЕ ====
@@ -1685,6 +1786,12 @@ class RogueGame:
             return
 
         # --- обычная игра ---
+        # Сон и паралич обездвиживают целиком: раньше спящий персонаж всё ещё
+        # мог пить зелья, читать свитки и уходить по лестнице.
+        if self.p.frozen > 0 and cmd in self.TURN_COMMANDS:
+            self.msg("Ты не можешь пошевелиться!")
+            self.end_turn()
+            return
         if cmd == 'move':
             self.try_move_player(*arg)
         elif cmd == 'descend':
@@ -1709,7 +1816,7 @@ class RogueGame:
             self.prompt_item("Что съесть?", lambda i: i.kind == "food", self.eat)
         elif cmd == 'throw':
             self.prompt_item("Что метнуть?",
-                             lambda i: i.kind == "weapon" and WEAPONS.get(i.subtype, (0, 0, False))[2],
+                             lambda i: i.kind == "weapon" and is_throwable(i.subtype),
                              self.start_throw)
         elif cmd == 'drop':
             self.prompt_item("Что выбросить?", lambda i: True, self.drop)
@@ -1822,6 +1929,7 @@ class RogueGame:
     def close_overlay(self):
         self.overlay = None
         self.pending = None
+        self.pending_action = None
         self.mode = 'play'
 
     def open_overlay(self, kind, title, rows, footer=None):
@@ -1869,7 +1977,7 @@ class RogueGame:
         self.open_overlay('select', prompt, rows, footer="Тап по строке — выбрать · Отмена")
 
     def choose_item(self, it):
-        action = self.pending_action
+        action = self.pending_action   # close_overlay сбрасывает поле — читаем до
         self.close_overlay()
         if action:
             action(it)
@@ -2206,7 +2314,13 @@ class RogueGame:
         # снимает лишнюю нагрузку на CPU и экономит батарею.
         self.dirty = True
         while True:
-            events = pygame.event.get()
+            if self.hold_id is None and not self.dirty:
+                # Пока нечего перерисовывать и никто не удерживает кнопку —
+                # блокируемся на событии вместо холостых 30 кадров в секунду.
+                events = [pygame.event.wait()]
+                events.extend(pygame.event.get())
+            else:
+                events = pygame.event.get()
             if events:
                 self.dirty = True
             for e in events:
@@ -2228,6 +2342,34 @@ class RogueGame:
             self.clock.tick(FPS)
 
 
+def parse_size(text):
+    """'1080x2400' -> (1080, 2400). Пусто -> None (размер по экрану)."""
+    if not text:
+        return None
+    for sep in ("x", "X", "*", ","):
+        if sep in text:
+            w, _, h = text.partition(sep)
+            return (int(w), int(h))
+    raise ValueError("размер задаётся как ШИРИНАxВЫСОТА, например 1080x2400")
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        prog="PixRogue",
+        description="PixelRogue — классический Rogue в пиксельном стиле.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="зерно генератора: с одним зерном подземелье повторяется "
+                         "в точности (нужно для отчётов об ошибках и тестов)")
+    ap.add_argument("--size", default=None, metavar="ШИРИНАxВЫСОТА",
+                    help="размер окна, например 1080x2400; по умолчанию — по экрану")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    random.seed(args.seed)               # None -> энтропия системы
+    RogueGame(size=parse_size(args.size)).run()
+
+
 if __name__ == "__main__":
-    random.seed()
-    RogueGame().run()
+    main()

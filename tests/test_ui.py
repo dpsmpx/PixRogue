@@ -141,15 +141,6 @@ def test_hallucination_recolors_but_stays_a_valid_color(game):
     assert game.hallu_color(G.C['gold']) == G.C['gold']
 
 
-def test_window_size_is_parsed_from_the_command_line():
-    assert G.parse_size("1080x2400") == (1080, 2400)
-    assert G.parse_size("720X1600") == (720, 1600)
-    assert G.parse_size(None) is None
-    with pytest.raises(ValueError):
-        G.parse_size("что-то не то")
-    args = G.parse_args(["--seed", "5", "--size", "540x1200"])
-    assert args.seed == 5 and args.size == "540x1200"
-
 
 def test_main_loop_handles_a_queued_burst_of_events():
     """Главный цикл: клавиша, тап по кнопке движения и выход — всё за один

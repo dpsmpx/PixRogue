@@ -27,6 +27,7 @@ PixelRogue — классический Rogue в "пиксельном" стил
 
 import argparse
 import collections
+import os
 import pygame
 import random
 import sys
@@ -2342,6 +2343,9 @@ class RogueGame:
             self.clock.tick(FPS)
 
 
+MIN_WINDOW = (240, 320)
+
+
 def parse_size(text):
     """'1080x2400' -> (1080, 2400). Пусто -> None (размер по экрану)."""
     if not text:
@@ -2349,11 +2353,35 @@ def parse_size(text):
     for sep in ("x", "X", "*", ","):
         if sep in text:
             w, _, h = text.partition(sep)
-            return (int(w), int(h))
+            size = (int(w), int(h))
+            if size[0] < MIN_WINDOW[0] or size[1] < MIN_WINDOW[1]:
+                raise ValueError("окно меньше %dx%d не вмещает интерфейс" % MIN_WINDOW)
+            return size
     raise ValueError("размер задаётся как ШИРИНАxВЫСОТА, например 1080x2400")
 
 
-def parse_args(argv):
+def strip_launcher_noise(argv):
+    """Убрать из argv то, что подложил лаунчер, а не игрок.
+
+    Pydroid 3 (и не он один) кладёт в sys.argv всю командную строку целиком:
+    ['python3', '/storage/.../PixRogue.py']. Для argparse это неизвестные
+    аргументы — и игра падала с «unrecognized arguments» ещё до окна.
+    Путь к интерпретатору и к самому скрипту аргументами игры не являются
+    никогда, поэтому молча их отбрасываем.
+    """
+    script = os.path.basename(getattr(sys, "argv", [""])[0] or "")
+    out = []
+    for a in argv:
+        base = os.path.basename(a).lower()
+        if base.startswith("python") or base.endswith(".py"):
+            continue
+        if script and base == script.lower():
+            continue
+        out.append(a)
+    return out
+
+
+def build_parser():
     ap = argparse.ArgumentParser(
         prog="PixRogue",
         description="PixelRogue — классический Rogue в пиксельном стиле.")
@@ -2362,13 +2390,41 @@ def parse_args(argv):
                          "в точности (нужно для отчётов об ошибках и тестов)")
     ap.add_argument("--size", default=None, metavar="ШИРИНАxВЫСОТА",
                     help="размер окна, например 1080x2400; по умолчанию — по экрану")
-    return ap.parse_args(argv)
+    return ap
+
+
+def parse_args(argv):
+    """Разбор аргументов, который не может помешать игре запуститься.
+
+    Что бы ни лежало в командной строке, на выходе всегда рабочий набор
+    настроек: непонятные аргументы пропускаются, испорченные значения
+    заменяются значениями по умолчанию. Единственный штатный выход —
+    явный --help.
+    """
+    ap = build_parser()
+    try:
+        args, unknown = ap.parse_known_args(strip_launcher_noise(argv))
+    except SystemExit as exc:
+        if exc.code in (0, None):        # это --help, так и задумано
+            raise
+        sys.stderr.write("PixRogue: аргументы не разобраны, "
+                         "запускаюсь со значениями по умолчанию.\n")
+        return ap.parse_args([])
+    if unknown:
+        sys.stderr.write("PixRogue: аргументы пропущены: %s\n" % " ".join(unknown))
+    return args
 
 
 def main(argv=None):
-    args = parse_args(argv if argv is not None else sys.argv[1:])
+    args = parse_args(argv if argv is not None else list(getattr(sys, "argv", [])[1:]))
     random.seed(args.seed)               # None -> энтропия системы
-    RogueGame(size=parse_size(args.size)).run()
+    try:
+        size = parse_size(args.size)
+    except ValueError as exc:
+        sys.stderr.write("PixRogue: --size %s — %s; беру размер по экрану.\n"
+                         % (args.size, exc))
+        size = None
+    RogueGame(size=size).run()
 
 
 if __name__ == "__main__":
